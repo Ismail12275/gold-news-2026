@@ -68,7 +68,7 @@ KEYWORD_SCORES: dict[str, int] = {
     "petroleum": 1,
 }
 
-MIN_SCORE = 3  # articles below this are discarded before AI analysis
+MIN_SCORE = 1  # articles below this are discarded before AI analysis
 
 
 def score_article(title: str, summary: str) -> int:
