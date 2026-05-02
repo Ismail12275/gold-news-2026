@@ -1,0 +1,59 @@
+name: XAUUSD Macro News Bot
+
+on:
+  schedule:
+    # Runs every 15 minutes during major trading hours (Mon–Fri)
+    - cron: "0,15,30,45 6-20 * * 1-5"   # 06:00–20:00 UTC weekdays
+    - cron: "0 * * * 1-5"               # hourly outside trading hours
+  workflow_dispatch:                     # manual trigger button in GitHub UI
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Restore deduplication storage from cache ───────────────────────────
+      - name: Restore dedup storage
+        uses: actions/cache@v4
+        with:
+          path: storage.json
+          key: dedup-storage-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            dedup-storage-${{ runner.os }}-
+
+      # ── Python setup ──────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── Run one cycle (not infinite loop mode) ────────────────────────────
+      - name: Run bot cycle
+        env:
+          TELEGRAM_BOT_TOKEN:    ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:      ${{ secrets.TELEGRAM_CHAT_ID }}
+          ANTHROPIC_API_KEY:     ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY:        ${{ secrets.OPENAI_API_KEY }}
+          NEWSAPI_KEY:           ${{ secrets.NEWSAPI_KEY }}
+          MAX_MSG_PER_HOUR:      "5"
+          STORAGE_PATH:          "storage.json"
+          DEDUP_RETENTION_DAYS:  "7"
+          # ONE_SHOT=1 → main.py exits after one cycle instead of sleeping
+          ONE_SHOT:              "1"
+        run: python main.py
+
+      # ── Save updated storage back to cache ─────────────────────────────────
+      - name: Save dedup storage
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: storage.json
+          key: dedup-storage-${{ runner.os }}-${{ github.run_id }}
