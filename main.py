@@ -1,205 +1,167 @@
 """
-XAUUSD / USD Macro News Bot — Main Orchestrator
-Runs every 10-15 minutes, enforces all filtering logic.
+main.py — Orchestration loop for Gold/Forex News Alert Bot
+Fetches → Deduplicates → Analyzes → Sends bilingual alerts
 """
 
-import asyncio
-import logging
 import os
 import time
+import signal
+import sys
 from datetime import datetime, timezone
 
-from news_fetcher import fetch_news
-from analyzer import analyze_news
-from deduplicator import Deduplicator
-from telegram_sender import TelegramSender
+from news_fetcher import fetch_all_feeds, fetch_finnhub_news
+from deduplicator import filter_new, mark_sent
+from analyzer import analyze_and_format
+from telegram_sender import send_alert, send_startup_message
 
-# ── Logging ────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-log = logging.getLogger(__name__)
+# ─────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────
+POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL", "300"))   # 5 min default
+MIN_MACRO_SCORE = int(os.environ.get("MIN_MACRO_SCORE", "2"))          # Skip score 1 (info only)
+MIN_PRIORITY = int(os.environ.get("MIN_PRIORITY", "1"))                # 1=moderate, 2=high only
+SEND_NON_TRADABLE = os.environ.get("SEND_NON_TRADABLE", "false").lower() == "true"
+MAX_ALERTS_PER_CYCLE = int(os.environ.get("MAX_ALERTS_PER_CYCLE", "5"))  # Prevent spam
 
-# ── Constants ───────────────────────────────────────────────────────────────
-POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL", 600))   # 10 min default
-MAX_MESSAGES_PER_HOUR = int(os.getenv("MAX_MSG_PER_HOUR", 5))
+# ─────────────────────────────────────────────
+# GRACEFUL SHUTDOWN
+# ─────────────────────────────────────────────
+_running = True
 
-# ── Scoring ─────────────────────────────────────────────────────────────────
-KEYWORD_SCORES: dict[str, int] = {
-    # Fed / interest rates → +3
-    "federal reserve": 3,
-    "fed rate": 3,
-    "interest rate": 3,
-    "rate decision": 3,
-    "fomc": 3,
-    "ecb rate": 3,
-    "rate hike": 3,
-    "rate cut": 3,
-    "powell": 2,
-    "lagarde": 2,
-    "central bank": 2,
-    # Inflation → +2
-    "cpi": 2,
-    "ppi": 2,
-    "inflation": 2,
-    "consumer price": 2,
-    "producer price": 2,
-    # NFP → +3
-    "non-farm": 3,
-    "nonfarm": 3,
-    "nfp": 3,
-    "payroll": 3,
-    "jobs report": 3,
-    "unemployment": 2,
-    # Geopolitics → +2
-    "war": 2,
-    "conflict": 2,
-    "sanctions": 2,
-    "geopolitical": 2,
-    "crisis": 2,
-    "invasion": 2,
-    "nuclear": 3,
-    # Oil → +2
-    "oil shock": 2,
-    "opec": 2,
-    "crude oil": 2,
-    "petroleum": 1,
-}
+def _handle_signal(sig, frame):
+    global _running
+    print("\n[MAIN] Shutdown signal received — stopping after current cycle")
+    _running = False
 
-MIN_SCORE = 1  # articles below this are discarded before AI analysis
+signal.signal(signal.SIGTERM, _handle_signal)
+signal.signal(signal.SIGINT, _handle_signal)
 
 
-def score_article(title: str, summary: str) -> int:
-    """Return keyword-based importance score."""
-    text = (title + " " + summary).lower()
-    total = 0
-    matched = []
-    for kw, pts in KEYWORD_SCORES.items():
-        if kw in text:
-            total += pts
-            matched.append(kw)
-    if matched:
-        log.debug("Score %d — keywords: %s", total, matched)
-    return total
+# ─────────────────────────────────────────────
+# FILTER LOGIC
+# ─────────────────────────────────────────────
+def should_send(analysis: dict) -> bool:
+    """
+    Decide whether to send this alert based on quality thresholds.
+    """
+    score = analysis.get("macro_score", 1)
+    tradability = analysis.get("tradability", "Non-Tradable")
+
+    # Always skip pure noise
+    if score < MIN_MACRO_SCORE:
+        return False
+
+    # Optionally suppress non-tradable
+    if not SEND_NON_TRADABLE and tradability == "Non-Tradable":
+        return False
+
+    return True
 
 
-class HourlyRateLimiter:
-    """Tracks how many messages were sent in the current clock-hour."""
+# ─────────────────────────────────────────────
+# SINGLE PROCESSING CYCLE
+# ─────────────────────────────────────────────
+def run_cycle() -> int:
+    """
+    Fetch → filter → analyze → send one full cycle.
+    Returns number of alerts sent.
+    """
+    print(f"\n[MAIN] ⏱ Cycle start: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
 
-    def __init__(self, max_per_hour: int):
-        self.max = max_per_hour
-        self._bucket: list[float] = []
+    # 1. Fetch news
+    items = fetch_all_feeds(min_priority=MIN_PRIORITY)
+    finnhub_items = fetch_finnhub_news()
+    items = items + finnhub_items
 
-    def can_send(self) -> bool:
-        now = time.time()
-        self._bucket = [t for t in self._bucket if now - t < 3600]
-        return len(self._bucket) < self.max
+    print(f"[MAIN] Fetched {len(items)} candidate items")
 
-    def record(self):
-        self._bucket.append(time.time())
+    # 2. Deduplicate
+    new_items = filter_new(items)
+    print(f"[MAIN] {len(new_items)} new items after deduplication")
 
+    # 3. Cap per cycle (prioritize high score items)
+    # We process in priority order; analyzer assigns macro_score
+    new_items = new_items[:MAX_ALERTS_PER_CYCLE * 3]  # Allow headroom for filtering
 
-async def run_cycle(
-    dedup: Deduplicator,
-    sender: TelegramSender,
-    limiter: HourlyRateLimiter,
-) -> int:
-    """One fetch-analyse-send cycle. Returns number of messages sent."""
-    log.info("── Starting news cycle at %s", datetime.now(timezone.utc).isoformat())
-    articles = await fetch_news()
-    log.info("Fetched %d raw articles", len(articles))
+    sent_count = 0
 
-    sent = 0
-    for article in articles:
-        if not limiter.can_send():
-            log.warning("Hourly cap reached (%d msgs). Skipping remainder.", limiter.max)
+    for item in new_items:
+        if sent_count >= MAX_ALERTS_PER_CYCLE:
+            print(f"[MAIN] Reached cycle cap ({MAX_ALERTS_PER_CYCLE}) — stopping")
             break
 
-        title   = article.get("title", "").strip()
-        summary = article.get("summary", "").strip()
-        url     = article.get("url", "")
+        title = item.get("title", "")[:80]
+        print(f"[MAIN] Analyzing: {title}...")
 
-        if not title:
+        # 4. Analyze
+        analysis, message = analyze_and_format(item)
+
+        if not analysis or not message:
+            print(f"[MAIN] ⚠️ Analysis failed — skipping")
             continue
 
-        # ── 1. Pre-filter by keyword score ──────────────────────────────
-        score = score_article(title, summary)
-        if score < MIN_SCORE:
-            log.debug("SKIP (score %d < %d): %s", score, MIN_SCORE, title[:80])
+        score = analysis.get("macro_score", 1)
+        tradability = analysis.get("tradability", "?")
+        tone = analysis.get("tone", "?")
+        print(f"[MAIN] → Score: {score}/5 | {tone} | {tradability}")
+
+        # 5. Quality gate
+        if not should_send(analysis):
+            print(f"[MAIN] 🚫 Filtered (score={score}, tradability={tradability})")
+            # Still mark as seen to avoid re-analyzing
+            mark_sent(item)
             continue
 
-        # ── 2. Deduplication ────────────────────────────────────────────
-        if dedup.is_duplicate(title, summary):
-            log.debug("SKIP (duplicate): %s", title[:80])
-            continue
+        # 6. Send
+        ok = send_alert(message)
 
-        # ── 3. AI Analysis ──────────────────────────────────────────────
-        log.info("Analysing [score=%d]: %s", score, title[:80])
+        if ok:
+            mark_sent(item)
+            sent_count += 1
+            print(f"[MAIN] ✅ Alert sent ({sent_count}/{MAX_ALERTS_PER_CYCLE})")
+            time.sleep(1.5)  # Brief pause between sends
+        else:
+            print(f"[MAIN] ❌ Send failed — item will retry next cycle")
+
+    print(f"[MAIN] Cycle complete: {sent_count} alerts sent")
+    return sent_count
+
+
+# ─────────────────────────────────────────────
+# MAIN LOOP
+# ─────────────────────────────────────────────
+def main():
+    print("=" * 50)
+    print("🤖 Gold News Alert Bot — Starting")
+    print(f"   Poll interval  : {POLL_INTERVAL_SECONDS}s")
+    print(f"   Min macro score: {MIN_MACRO_SCORE}/5")
+    print(f"   Min priority   : {MIN_PRIORITY}")
+    print(f"   Max per cycle  : {MAX_ALERTS_PER_CYCLE}")
+    print("=" * 50)
+
+    send_startup_message()
+
+    while _running:
         try:
-            analysis = await analyze_news(title, summary)
-        except Exception as exc:
-            log.error("AI analysis failed for '%s': %s", title[:60], exc)
-            continue
+            run_cycle()
+        except Exception as e:
+            print(f"[MAIN] ❌ Unhandled cycle error: {e}")
+            import traceback
+            traceback.print_exc()
 
-        # ── 4. Final gate: Strength=High OR Tradable=Yes ─────────────────
-        strength  = analysis.get("strength", "").lower()
-        tradable  = analysis.get("tradable", "").lower()
+        if not _running:
+            break
 
-        if strength != "high" and tradable != "yes":
-            log.info(
-                "SKIP (strength=%s, tradable=%s): %s",
-                strength, tradable, title[:60],
-            )
-            continue
+        print(f"[MAIN] 💤 Sleeping {POLL_INTERVAL_SECONDS}s...")
+        # Sleep in small increments to allow clean shutdown
+        for _ in range(POLL_INTERVAL_SECONDS):
+            if not _running:
+                break
+            time.sleep(1)
 
-        # ── 5. Send ──────────────────────────────────────────────────────
-        try:
-            await sender.send(article, analysis, score)
-            dedup.mark_sent(title, summary)
-            limiter.record()
-            sent += 1
-            log.info("✅ Sent: %s", title[:80])
-        except Exception as exc:
-            log.error("Failed to send message: %s", exc)
-
-    log.info("── Cycle complete. %d message(s) sent.", sent)
-    return sent
-
-
-ONE_SHOT = os.getenv("ONE_SHOT", "0") == "1"   # GitHub Actions mode
-
-
-async def main():
-    log.info("🤖 XAUUSD/USD Macro Bot starting… (one_shot=%s)", ONE_SHOT)
-    dedup   = Deduplicator()
-    sender  = TelegramSender()
-    limiter = HourlyRateLimiter(MAX_MESSAGES_PER_HOUR)
-
-    # Send startup ping only on first ever run (storage is empty)
-    if dedup.count() == 0 and not ONE_SHOT:
-        await sender.send_startup_message()
-
-    if ONE_SHOT:
-        # GitHub Actions: one cycle then exit
-        try:
-            await run_cycle(dedup, sender, limiter)
-        except Exception as exc:
-            log.error("Unhandled error: %s", exc, exc_info=True)
-        return
-
-    # Railway / server: infinite loop
-    while True:
-        try:
-            await run_cycle(dedup, sender, limiter)
-        except Exception as exc:
-            log.error("Unhandled error in main cycle: %s", exc, exc_info=True)
-
-        next_run = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        log.info("💤 Sleeping %ds … (next run after %s)", POLL_INTERVAL_SECONDS, next_run)
-        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+    print("[MAIN] Stopped cleanly")
+    sys.exit(0)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
