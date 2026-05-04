@@ -1,340 +1,176 @@
 """
-telegram_sender.py — Professional Telegram alert sender
-Updated for Gemini / Ollama / Rule-based bot architecture
+telegram_sender.py — Professional Telegram message delivery
+Handles Unicode Arabic, Markdown formatting, chunking, and retry logic
 """
 
-import asyncio
-import logging
 import os
-from datetime import datetime, timezone
-from typing import Any
+import time
+import requests
+from typing import Optional
 
-import aiohttp
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-log = logging.getLogger(__name__)
+# Telegram message char limit
+TELEGRAM_MAX_CHARS = 4096
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-
-TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
-
-# ── Emoji Maps ─────────────────────────────────────────────────────────────
-USD_EMOJI = {
-    "Bullish": "🟢",
-    "Bearish": "🔴",
-    "Neutral": "🟡",
-}
-
-GOLD_EMOJI = {
-    "Bullish": "⬆️",
-    "Bearish": "⬇️",
-    "Neutral": "➡️",
-}
-
-STR_EMOJI = {
-    "High": "🔥",
-    "Medium": "⚡",
-    "Low": "📉",
-}
-
-TRD_EMOJI = {
-    "Yes": "✅",
-    "No": "❌",
-}
-
-# ── Category Detection ─────────────────────────────────────────────────────
-CATEGORY_MAP: list[tuple[list[str], str]] = [
-    (
-        [
-            "fomc",
-            "federal reserve",
-            "fed rate",
-            "rate decision",
-            "rate hike",
-            "rate cut",
-            "ecb",
-        ],
-        "🏦 Rate Decision",
-    ),
-    (
-        [
-            "cpi",
-            "inflation",
-            "ppi",
-            "consumer price",
-            "producer price",
-        ],
-        "📊 Inflation Data",
-    ),
-    (
-        [
-            "non-farm",
-            "nonfarm",
-            "nfp",
-            "payroll",
-            "jobs report",
-            "unemployment",
-        ],
-        "💼 Jobs / NFP",
-    ),
-    (
-        [
-            "powell",
-            "lagarde",
-            "central bank",
-            "speech",
-            "testimony",
-        ],
-        "🎙️ Central Bank Speech",
-    ),
-    (
-        [
-            "war",
-            "conflict",
-            "invasion",
-            "nuclear",
-            "sanction",
-            "geopolitical",
-            "crisis",
-        ],
-        "⚔️ Geopolitics",
-    ),
-    (
-        [
-            "oil",
-            "opec",
-            "crude",
-            "petroleum",
-        ],
-        "🛢️ Oil Shock",
-    ),
-]
+# Retry config
+MAX_RETRIES = 3
+RETRY_DELAY = 2  # seconds
 
 
-def _detect_category(title: str, summary: str) -> str:
-    text = (title + " " + summary).lower()
-
-    for keywords, label in CATEGORY_MAP:
-        if any(keyword in text for keyword in keywords):
-            return label
-
-    return "📰 Macro Event"
-
-
-# ── Message Builder ────────────────────────────────────────────────────────
-def _build_message(
-    article: dict[str, Any],
-    analysis: dict[str, Any],
-    score: int,
-) -> str:
-    title = article.get("title", "No title")
-    url = article.get("url", "")
-    source = article.get("source", "Unknown")
-
-    usd = analysis.get("usd_impact", "Neutral")
-    gold = analysis.get("gold_impact", "Neutral")
-    strength = analysis.get("strength", "Low")
-    tradable = analysis.get("tradable", "No")
-    explanation = analysis.get("explanation", "")
-
-    category = _detect_category(
-        title,
-        article.get("summary", ""),
-    )
-
-    ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
-
-    score_bar = (
-        "●" * min(score, 5)
-        + "○" * max(0, 5 - score)
-    )
-
-    lines = [
-        "🚨 <b>HIGH IMPACT NEWS ALERT</b>",
-        "",
-        f"{category}",
-        "",
-        f"📌 <b>Title:</b> {title}",
-        "",
-        f"💵 <b>USD Impact:</b> {USD_EMOJI.get(usd, '🟡')} {usd}",
-        f"🥇 <b>Gold Impact:</b> {GOLD_EMOJI.get(gold, '➡️')} {gold}",
-        "",
-        f"{STR_EMOJI.get(strength, '📉')} <b>Strength:</b> {strength}",
-        f"{TRD_EMOJI.get(tradable, '❌')} <b>Tradable:</b> {tradable}",
-        "",
-        f"📝 <b>Analysis:</b> <i>{explanation}</i>",
-        "",
-        f"⚡ <b>Macro Score:</b> [{score_bar}] {score}/5+",
-        f"🕐 {ts} | 📡 {source}",
-    ]
-
-    if url:
-        lines.extend(
-            [
-                "",
-                f'🔗 <a href="{url}">Read Full Article</a>',
-            ]
-        )
-
-    return "\n".join(lines)
-
-
-# ── Telegram Sending ───────────────────────────────────────────────────────
-async def _send_single(
-    session: aiohttp.ClientSession,
-    chat_id: str,
-    text: str,
-    retries: int = 3,
+# ─────────────────────────────────────────────
+# CORE SEND FUNCTION
+# ─────────────────────────────────────────────
+def send_message(
+    message: str,
+    chat_id: Optional[str] = None,
+    parse_mode: str = "Markdown",
+    disable_web_preview: bool = True,
 ) -> bool:
-    endpoint = f"{TELEGRAM_API}/sendMessage"
+    """
+    Send a Telegram message with retry logic and chunking for long messages.
+
+    Args:
+        message: The message text (supports Markdown and Unicode/Arabic)
+        chat_id: Override the default chat ID
+        parse_mode: "Markdown" or "HTML"
+        disable_web_preview: Disable link previews
+
+    Returns:
+        True if all chunks sent successfully, False otherwise
+    """
+    if not TELEGRAM_BOT_TOKEN or not (chat_id or TELEGRAM_CHAT_ID):
+        print("[TELEGRAM] Missing BOT_TOKEN or CHAT_ID — skipping send")
+        return False
+
+    target_chat = chat_id or TELEGRAM_CHAT_ID
+
+    # Split long messages into chunks at natural line breaks
+    chunks = _split_message(message, TELEGRAM_MAX_CHARS)
+
+    all_ok = True
+    for i, chunk in enumerate(chunks):
+        ok = _send_with_retry(
+            chunk,
+            target_chat,
+            parse_mode,
+            disable_web_preview,
+            attempt_label=f"chunk {i+1}/{len(chunks)}",
+        )
+        if not ok:
+            all_ok = False
+        if len(chunks) > 1:
+            time.sleep(0.5)  # Avoid rate limiting between chunks
+
+    return all_ok
+
+
+def _send_with_retry(
+    text: str,
+    chat_id: str,
+    parse_mode: str,
+    disable_web_preview: bool,
+    attempt_label: str = "",
+) -> bool:
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
     payload = {
-        "chat_id": chat_id.strip(),
+        "chat_id": chat_id,
         "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": disable_web_preview,
     }
 
-    for attempt in range(1, retries + 1):
+    for attempt in range(1, MAX_RETRIES + 1):
         try:
-            async with session.post(
-                endpoint,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=20),
-            ) as resp:
-                data = await resp.json()
+            resp = requests.post(url, json=payload, timeout=15)
+            data = resp.json()
 
-                if resp.status == 200 and data.get("ok"):
-                    return True
+            if data.get("ok"):
+                print(f"[TELEGRAM] ✅ Sent {attempt_label}")
+                return True
 
-                err = data.get(
-                    "description",
-                    "unknown error",
-                )
+            error_code = data.get("error_code", 0)
+            description = data.get("description", "Unknown error")
 
-                log.warning(
-                    "Telegram rejected (attempt %d/%d) chat=%s: %s",
-                    attempt,
-                    retries,
-                    chat_id,
-                    err,
-                )
+            # If Markdown parsing failed, retry as plain text
+            if error_code == 400 and "parse" in description.lower() and parse_mode != "":
+                print(f"[TELEGRAM] ⚠️ Markdown parse error — retrying as plain text")
+                payload["parse_mode"] = ""
+                continue
 
-                if resp.status == 429:
-                    retry_after = int(
-                        data.get(
-                            "parameters",
-                            {},
-                        ).get(
-                            "retry_after",
-                            5,
-                        )
-                    )
+            # Rate limited — back off
+            if error_code == 429:
+                retry_after = data.get("parameters", {}).get("retry_after", 5)
+                print(f"[TELEGRAM] Rate limited — waiting {retry_after}s")
+                time.sleep(retry_after)
+                continue
 
-                    log.info(
-                        "Rate limited — sleeping %ds",
-                        retry_after,
-                    )
+            print(f"[TELEGRAM] ❌ API error {error_code}: {description}")
+            return False
 
-                    await asyncio.sleep(retry_after)
+        except requests.exceptions.Timeout:
+            print(f"[TELEGRAM] ⏱ Timeout on attempt {attempt}/{MAX_RETRIES}")
+        except requests.exceptions.RequestException as e:
+            print(f"[TELEGRAM] 🔌 Network error on attempt {attempt}/{MAX_RETRIES}: {e}")
 
-        except aiohttp.ClientError as exc:
-            log.warning(
-                "Network error sending to %s (attempt %d): %s",
-                chat_id,
-                attempt,
-                exc,
-            )
+        if attempt < MAX_RETRIES:
+            time.sleep(RETRY_DELAY * attempt)
 
-            await asyncio.sleep(2**attempt)
-
+    print(f"[TELEGRAM] ❌ All {MAX_RETRIES} attempts failed for {attempt_label}")
     return False
 
 
-# ── Main Sender Class ──────────────────────────────────────────────────────
-class TelegramSender:
-    def __init__(self):
-        if not TELEGRAM_TOKEN:
-            log.error(
-                "TELEGRAM_BOT_TOKEN is missing!"
-            )
+def _split_message(message: str, max_chars: int) -> list[str]:
+    """
+    Split a message into chunks no larger than max_chars,
+    splitting at newlines to preserve formatting.
+    """
+    if len(message) <= max_chars:
+        return [message]
 
-        if not TELEGRAM_CHAT_ID:
-            log.error(
-                "TELEGRAM_CHAT_ID is missing!"
-            )
+    chunks = []
+    lines = message.split("\n")
+    current = ""
 
-        self._chat_ids = [
-            cid.strip()
-            for cid in TELEGRAM_CHAT_ID.split(",")
-            if cid.strip()
-        ]
+    for line in lines:
+        test = current + "\n" + line if current else line
+        if len(test) > max_chars:
+            if current:
+                chunks.append(current)
+            current = line
+        else:
+            current = test
 
-    async def send(
-        self,
-        article: dict[str, Any],
-        analysis: dict[str, Any],
-        score: int,
-    ) -> bool:
-        text = _build_message(
-            article,
-            analysis,
-            score,
-        )
+    if current:
+        chunks.append(current)
 
-        async with aiohttp.ClientSession() as session:
-            results = await asyncio.gather(
-                *[
-                    _send_single(
-                        session,
-                        cid,
-                        text,
-                    )
-                    for cid in self._chat_ids
-                ],
-                return_exceptions=True,
-            )
+    return chunks
 
-        success = all(
-            result is True
-            for result in results
-        )
 
-        if not success:
-            failures = [
-                result
-                for result in results
-                if result is not True
-            ]
+# ─────────────────────────────────────────────
+# ALERT SENDER (high-level interface)
+# ─────────────────────────────────────────────
+def send_alert(formatted_message: str, chat_id: Optional[str] = None) -> bool:
+    """
+    Send a formatted news alert to Telegram.
+    Handles Arabic Unicode and Markdown gracefully.
+    """
+    # Ensure proper Unicode — Python handles this natively,
+    # but we explicitly encode/decode to avoid any transit corruption
+    if isinstance(formatted_message, bytes):
+        formatted_message = formatted_message.decode("utf-8")
 
-            log.warning(
-                "%d chat(s) failed: %s",
-                len(failures),
-                failures,
-            )
+    return send_message(formatted_message, chat_id=chat_id)
 
-        return success
 
-    async def send_startup_message(self) -> None:
-        ts = datetime.now(
-            timezone.utc
-        ).strftime(
-            "%Y-%m-%d %H:%M UTC"
-        )
-
-        text = (
-            "🤖 <b>XAUUSD/USD Macro Bot Online</b>\n\n"
-            f"✅ Bot started at {ts}\n"
-            "📡 Monitoring: Yahoo Finance, Federal Reserve, ECB, ForexLive, NewsAPI\n"
-            "🧠 AI: Gemini + Ollama + Rule-based fallback\n"
-            "⏱️ Polling every 10 minutes\n"
-            "🔕 Only HIGH IMPACT events will be reported."
-        )
-
-        async with aiohttp.ClientSession() as session:
-            for cid in self._chat_ids:
-                await _send_single(
-                    session,
-                    cid,
-                    text,
-                )
+def send_startup_message() -> None:
+    """Send a startup notification to the channel."""
+    msg = (
+        "🤖 *Gold News Bot — Active*\n"
+        "Monitoring macro news for XAUUSD & USD\n"
+        "─────────────────────\n"
+        "_Institutional-grade bilingual alerts enabled_"
+    )
+    send_message(msg)
