@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 
 from news_fetcher import fetch_all_feeds, fetch_finnhub_news
 from deduplicator import filter_new, mark_sent
-from analyzer import analyze_and_format
+from analyzer import analyze_and_format, validate_env
 from telegram_sender import send_alert, send_startup_message
 
 # ─────────────────────────────────────────────
@@ -138,6 +138,15 @@ def main():
     print(f"   Min priority   : {MIN_PRIORITY}")
     print(f"   Max per cycle  : {MAX_ALERTS_PER_CYCLE}")
     print("=" * 50)
+
+    # ── Critical env check before doing anything ──
+    if not validate_env():
+        print("\n💡 HOW TO FIX ON RAILWAY:")
+        print("   1. Go to your Railway project")
+        print("   2. Click your service → Variables tab")
+        print("   3. Add: ANTHROPIC_API_KEY = sk-ant-...")
+        print("   4. Railway will auto-redeploy\n")
+        sys.exit(1)
 
     send_startup_message()
 
