@@ -1,325 +1,286 @@
 """
-analyzer.py — Free AI-powered news impact analyzer
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Priority chain (first success wins):
-
-  1. Google Gemini Flash  — free tier, 15 req/min, no card required
-                            Set GEMINI_API_KEY in .env
-                            Get key → https://aistudio.google.com/app/apikey
-
-  2. Ollama (local LLM)  — fully free, offline, no API key
-                            Install → https://ollama.com
-                            Run     → ollama pull gemma2   (or mistral / llama3.2)
-                            Set OLLAMA_MODEL in .env to override default
-
-  3. Rule-based fallback — always available, no network, no keys
-
-Public interface is UNCHANGED — analyze_news(title, summary) still returns:
-  {usd_impact, gold_impact, strength, tradable, explanation}
+analyzer.py — Institutional-grade macro analysis engine
+Produces bilingual (EN/AR) Telegram alerts for XAUUSD & USD traders
 """
 
-import asyncio
-import json
-import logging
 import os
+import json
 import re
-from typing import Any
+import anthropic
+from datetime import datetime
 
-import aiohttp
+client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
-log = logging.getLogger(__name__)
+# ─────────────────────────────────────────────
+# SYSTEM PROMPT
+# ─────────────────────────────────────────────
+SYSTEM_PROMPT = """You are a senior macro analyst at a tier-1 institutional trading desk specializing in USD and Gold (XAUUSD).
 
-# ── Free API config ───────────────────────────────────────────────────────────
+Your job is to analyze financial news and produce structured JSON output used to generate real-time trading alerts for professional discretionary traders.
 
-# Option A — Google Gemini (free tier)
-# Free quota: 15 RPM / 1,500 req per day  (gemini-1.5-flash)
-# No billing required for free tier.
-# Get your key: https://aistudio.google.com/app/apikey
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
-GEMINI_URL     = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    + GEMINI_MODEL + ":generateContent"
-)
+ANALYSIS FRAMEWORK:
+- Classify monetary tone: Hawkish (rate-hike bias / tightening), Dovish (rate-cut bias / easing), or Neutral
+- Assess USD directional impact: bullish, bearish, or neutral — with explicit macro reasoning
+- Assess Gold directional impact: bullish, bearish, or neutral — with explicit macro reasoning
+- Score macro importance 1–5 based on market-repricing potential
+- Assess tradability: High Conviction / Moderate / Low Conviction / Non-Tradable
+- Write a professional institutional summary (2–4 sentences) — no generic phrases like "limited directional signal"
+- Write a full professional Arabic translation of the alert using proper financial Arabic terminology
 
-# Option B — Ollama (local, fully offline)
-# Default host = same machine; on Railway/VPS set OLLAMA_HOST=http://<host>:11434
-OLLAMA_HOST  = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma2")
-OLLAMA_URL   = OLLAMA_HOST + "/api/generate"
+MACRO SCORING RULES:
+5 = FOMC decision, CPI beat/miss, NFP shock — major repricing potential across rates/FX/gold
+4 = Fed speaker with clear policy shift signal, PCE data, strong PMI deviation — strong directional catalyst
+3 = Regional Fed commentary, ISM data, housing data — moderate institutional relevance
+2 = Secondary data or vague statement — weak but market-notable
+1 = Purely informational, pre-known, zero surprise factor
 
-# Timeouts
-GEMINI_TIMEOUT = 20
-OLLAMA_TIMEOUT = 45
+TRADABILITY RULES:
+- "High Conviction": Direct FOMC/CPI/NFP, clear policy pivot signal, major data surprise
+- "Moderate": Fed speech with conditional language, mixed data, geopolitical developments
+- "Low Conviction": Speech without new information, data in-line with expectations
+- "Non-Tradable": Pre-announced, fully priced-in, ceremonial statements
 
-# ── Shared prompt ─────────────────────────────────────────────────────────────
-SYSTEM_PROMPT = (
-    "You are a professional macro-economic analyst specialising in "
-    "Gold (XAUUSD) and the US Dollar (USD). You receive financial news headlines and "
-    "summaries and return a strict JSON impact assessment. You are concise and precise."
-)
+USD IMPACT LOGIC:
+- Hawkish signals → USD bullish (higher rates attract capital flows)
+- Dovish signals → USD bearish (rate cuts reduce yield differential)
+- Risk-off events → USD bullish (safe haven demand)
+- Inflation above target → USD bullish (forces Fed action)
+- Weak labor market → USD bearish (Fed easing pressure)
 
+GOLD IMPACT LOGIC:
+- USD strength → Gold bearish (inverse correlation)
+- Real yields rising → Gold bearish (opportunity cost)
+- Dovish pivot → Gold bullish (lower real rates)
+- Risk-off / geopolitical → Gold bullish (safe haven)
+- Inflation above expectations → Gold bullish (inflation hedge)
+- Fed pause/cut → Gold bullish
 
-def build_user_prompt(title: str, summary: str) -> str:
-    return (
-        "Analyse the following financial news and return ONLY a valid JSON object "
-        "with these exact keys:\n\n"
-        "{\n"
-        '  "usd_impact":   "Bullish" | "Bearish" | "Neutral",\n'
-        '  "gold_impact":  "Bullish" | "Bearish" | "Neutral",\n'
-        '  "strength":     "Low" | "Medium" | "High",\n'
-        '  "tradable":     "Yes" | "No",\n'
-        '  "explanation":  "<one sentence, max 25 words, plain English>"\n'
-        "}\n\n"
-        "Rules:\n"
-        "- USD Bullish = strong USD, higher rates, hawkish Fed\n"
-        "- USD Bearish = weak USD, rate cuts, dovish Fed, geopolitical risk\n"
-        "- Gold Bullish = safe-haven demand, USD weakness, geopolitical fear, inflation\n"
-        "- Gold Bearish = USD strength, hawkish Fed, falling inflation\n"
-        "- Strength = High if market-moving data (NFP, CPI, rate decision, war escalation)\n"
-        "- Tradable = Yes if the news is likely to cause a tradeable XAUUSD move TODAY\n"
-        "- Return ONLY the JSON object, no markdown, no preamble\n\n"
-        f"News Title:   {title}\n"
-        f"News Summary: {summary}"
-    )
+ARABIC TERMINOLOGY STANDARDS:
+- Hawkish = تشدد نقدي
+- Dovish = تيسير نقدي
+- Neutral = محايد
+- Bullish Gold = إيجابي للذهب
+- Bearish Gold = سلبي للذهب
+- USD Supportive = داعم للدولار
+- USD Negative = ضاغط على الدولار
+- Federal Reserve = الاحتياطي الفيدرالي
+- Interest rates = أسعار الفائدة
+- Inflation = التضخم
+- Monetary policy = السياسة النقدية
+- Treasury yields = عوائد السندات الخزينة
+- Safe haven = الملاذ الآمن
+- Market repricing = إعادة تسعير السوق
+- Risk sentiment = معنويات المخاطرة
 
+NEVER use: "limited directional signal", "unclear impact", "mixed signals without elaboration", "it depends"
+ALWAYS explain the macro transmission mechanism (why does this move gold/USD)
 
-# ── JSON extractor / validator (unchanged) ────────────────────────────────────
-def _extract_json(raw: str) -> dict[str, Any]:
-    raw = re.sub(r"```(?:json)?", "", raw).strip()
-    match = re.search(r"\{.*\}", raw, re.DOTALL)
-    if not match:
-        raise ValueError(f"No JSON object found in response: {raw[:200]}")
-
-    data = json.loads(match.group())
-
-    allowed_usd_gold = {"bullish", "bearish", "neutral"}
-    allowed_strength = {"low", "medium", "high"}
-    allowed_tradable = {"yes", "no"}
-
-    usd      = str(data.get("usd_impact",  "Neutral")).strip().capitalize()
-    gold     = str(data.get("gold_impact", "Neutral")).strip().capitalize()
-    strength = str(data.get("strength",    "Low")).strip().capitalize()
-    tradable = str(data.get("tradable",    "No")).strip().capitalize()
-    explain  = str(data.get("explanation", "")).strip()
-
-    if usd.lower()      not in allowed_usd_gold: usd      = "Neutral"
-    if gold.lower()     not in allowed_usd_gold: gold     = "Neutral"
-    if strength.lower() not in allowed_strength: strength = "Low"
-    if tradable.lower() not in allowed_tradable: tradable = "No"
-
-    return {
-        "usd_impact":  usd,
-        "gold_impact": gold,
-        "strength":    strength,
-        "tradable":    tradable,
-        "explanation": explain[:200],
-    }
+OUTPUT FORMAT (strict JSON, no markdown):
+{
+  "category": "string (e.g. Federal Reserve / Economic Data / Geopolitical / Central Bank)",
+  "title": "string (concise headline)",
+  "tone": "Hawkish | Dovish | Neutral",
+  "usd_impact": "Bullish | Bearish | Neutral",
+  "usd_reasoning": "string (1–2 sentences)",
+  "gold_impact": "Bullish | Bearish | Neutral",
+  "gold_reasoning": "string (1–2 sentences)",
+  "macro_score": 1–5,
+  "macro_score_reason": "string",
+  "tradability": "High Conviction | Moderate | Low Conviction | Non-Tradable",
+  "tradability_reason": "string",
+  "professional_analysis": "string (2–4 institutional-quality sentences, no generic phrases)",
+  "arabic_title": "string",
+  "arabic_tone": "string",
+  "arabic_usd_impact": "string",
+  "arabic_gold_impact": "string",
+  "arabic_analysis": "string (full professional Arabic summary, natural financial Arabic, not literal translation)"
+}"""
 
 
-# ── Option A — Google Gemini (free tier) ─────────────────────────────────────
-async def _analyse_with_gemini(
-    session: aiohttp.ClientSession,
-    title: str,
-    summary: str,
-) -> dict[str, Any]:
-    full_prompt = SYSTEM_PROMPT + "\n\n" + build_user_prompt(title, summary)
-
-    payload = {
-        "contents": [{"parts": [{"text": full_prompt}]}],
-        "generationConfig": {
-            "temperature": 0.1,
-            "maxOutputTokens": 300,
-            "topP": 0.9,
-        },
-        "safetySettings": [
-            {
-                "category":  "HARM_CATEGORY_DANGEROUS_CONTENT",
-                "threshold": "BLOCK_ONLY_HIGH",
-            }
-        ],
-    }
-
-    async with session.post(
-        GEMINI_URL,
-        json=payload,
-        params={"key": GEMINI_API_KEY},
-        timeout=aiohttp.ClientTimeout(total=GEMINI_TIMEOUT),
-    ) as resp:
-        if resp.status == 429:
-            raise RuntimeError("Gemini rate-limit (429)")
-        if resp.status != 200:
-            body = await resp.text()
-            raise RuntimeError(f"Gemini API HTTP {resp.status}: {body[:300]}")
-        data = await resp.json()
-
-    try:
-        raw = data["candidates"][0]["content"]["parts"][0]["text"]
-    except (KeyError, IndexError) as exc:
-        raise ValueError(f"Unexpected Gemini response: {exc}") from exc
-
-    return _extract_json(raw)
-
-
-# ── Option B — Ollama (local, fully free) ────────────────────────────────────
-async def _analyse_with_ollama(
-    session: aiohttp.ClientSession,
-    title: str,
-    summary: str,
-) -> dict[str, Any]:
-    full_prompt = (
-        "<|system|>\n" + SYSTEM_PROMPT + "\n<|end|>\n"
-        "<|user|>\n" + build_user_prompt(title, summary) + "\n<|end|>\n"
-        "<|assistant|>\n"
-    )
-
-    payload = {
-        "model":  OLLAMA_MODEL,
-        "prompt": full_prompt,
-        "stream": False,
-        "options": {"temperature": 0.1, "num_predict": 300, "top_p": 0.9},
-    }
-
-    try:
-        async with session.post(
-            OLLAMA_URL,
-            json=payload,
-            timeout=aiohttp.ClientTimeout(total=OLLAMA_TIMEOUT),
-        ) as resp:
-            if resp.status == 404:
-                raise RuntimeError(
-                    f"Model '{OLLAMA_MODEL}' not found — run: ollama pull {OLLAMA_MODEL}"
-                )
-            if resp.status != 200:
-                body = await resp.text()
-                raise RuntimeError(f"Ollama HTTP {resp.status}: {body[:300]}")
-            data = await resp.json()
-    except aiohttp.ClientConnectorError:
-        raise RuntimeError(
-            f"Cannot reach Ollama at {OLLAMA_HOST} — run: ollama serve"
-        )
-
-    raw = data.get("response", "").strip()
-    if not raw:
-        raise ValueError("Ollama returned an empty response")
-
-    return _extract_json(raw)
-
-
-# ── Fallback — enhanced rule-based scoring (zero dependencies) ────────────────
-def _rule_based_fallback(title: str, summary: str) -> dict[str, Any]:
-    text = (title + " " + summary).lower()
-
-    USD_BULLISH_KW = [
-        "rate hike", "hawkish", "strong dollar", "tightening",
-        "beats expectations", "better than expected", "hotter than expected",
-        "above forecast", "fed hikes", "fomc hikes", "rate increase",
-        "dollar surges", "dollar strengthens",
-    ]
-    USD_BEARISH_KW = [
-        "rate cut", "dovish", "weak dollar", "recession", "war",
-        "conflict", "crisis", "geopolit", "misses expectations",
-        "below forecast", "worse than expected", "fed cuts", "fomc cuts",
-        "rate decrease", "dollar falls", "dollar weakens", "slowdown",
-    ]
-    bull_usd = sum(1 for k in USD_BULLISH_KW if k in text)
-    bear_usd = sum(1 for k in USD_BEARISH_KW if k in text)
-    usd = "Bullish" if bull_usd > bear_usd else "Bearish" if bear_usd > bull_usd else "Neutral"
-
-    GOLD_BULLISH_KW = [
-        "gold rises", "gold rally", "gold surges", "gold climbs",
-        "safe haven", "safe-haven", "geopolit", "nuclear",
-        "inflation surges", "inflation rises", "xauusd up",
-    ]
-    GOLD_BEARISH_KW = [
-        "gold falls", "gold drops", "gold slumps", "gold declines",
-        "rate hike", "fed hikes", "xauusd down",
-    ]
-    bull_gold = sum(1 for k in GOLD_BULLISH_KW if k in text)
-    bear_gold = sum(1 for k in GOLD_BEARISH_KW if k in text)
-
-    if bull_gold > bear_gold:
-        gold = "Bullish"
-    elif bear_gold > bull_gold:
-        gold = "Bearish"
-    else:
-        gold = {"Bearish": "Bullish", "Bullish": "Bearish"}.get(usd, "Neutral")
-
-    HIGH_KW = [
-        "fomc", "rate decision", "nfp", "non-farm", "nonfarm", "cpi report",
-        "war escalat", "nuclear", "fed hikes", "fed cuts", "inflation report",
-    ]
-    MED_KW = [
-        "inflation", "payroll", "ecb", "powell", "lagarde", "ppi",
-        "unemployment", "jobs report", "gdp", "retail sales", "pmi",
-    ]
-    strength = (
-        "High"   if any(k in text for k in HIGH_KW) else
-        "Medium" if any(k in text for k in MED_KW)  else
-        "Low"
-    )
-
-    EXPLANATIONS = {
-        ("Bullish", "Bearish"): "Hawkish USD signals put downward pressure on gold.",
-        ("Bullish", "Neutral"): "USD strength noted; gold direction unclear.",
-        ("Bullish", "Bullish"): "Mixed signals — confirm with price action.",
-        ("Bearish", "Bullish"): "USD weakness supports gold safe-haven demand.",
-        ("Bearish", "Neutral"): "USD under pressure; gold lacks clear catalyst.",
-        ("Bearish", "Bearish"): "Risk-off selling hitting both USD and gold.",
-        ("Neutral", "Bullish"): "Gold demand rising on non-USD catalyst.",
-        ("Neutral", "Bearish"): "Gold faces headwinds despite stable USD.",
-        ("Neutral", "Neutral"): "Limited directional signal from this news.",
-    }
-
-    return {
-        "usd_impact":  usd,
-        "gold_impact": gold,
-        "strength":    strength,
-        "tradable":    "Yes" if strength == "High" else "No",
-        "explanation": EXPLANATIONS.get((usd, gold), "Rule-based fallback — AI unavailable."),
-    }
-
-
-# ── Public API — SIGNATURE UNCHANGED ─────────────────────────────────────────
-async def analyze_news(title: str, summary: str) -> dict[str, Any]:
+# ─────────────────────────────────────────────
+# CORE ANALYSIS FUNCTION
+# ─────────────────────────────────────────────
+def analyze_news(news_item: dict) -> dict | None:
     """
-    Analyse macro news impact on USD and Gold using free AI only.
+    Analyze a news item and return structured institutional analysis.
 
-    Priority chain:
-      1. Google Gemini Flash  — fastest free cloud AI (set GEMINI_API_KEY)
-      2. Ollama local LLM     — fully offline, no cost  (ollama serve)
-      3. Rule-based fallback  — always works, no dependencies
+    Args:
+        news_item: dict with keys: title, summary, source, published_at, category (optional)
 
     Returns:
-      { usd_impact, gold_impact, strength, tradable, explanation }
+        dict with full analysis or None on failure
     """
-    async with aiohttp.ClientSession() as session:
+    title = news_item.get("title", "")
+    summary = news_item.get("summary", "")
+    source = news_item.get("source", "Unknown")
+    published_at = news_item.get("published_at", datetime.utcnow().isoformat())
+    category_hint = news_item.get("category", "")
 
-        # Tier 1 — Gemini (free cloud)
-        if GEMINI_API_KEY:
-            try:
-                result = await _analyse_with_gemini(session, title, summary)
-                log.debug("Gemini analysis OK: %s", result)
-                return result
-            except RuntimeError as exc:
-                if "429" in str(exc):
-                    log.warning("Gemini rate-limited — trying Ollama…")
-                    await asyncio.sleep(4)
-                else:
-                    log.warning("Gemini failed (%s) — trying Ollama…", exc)
-            except Exception as exc:
-                log.warning("Gemini error (%s) — trying Ollama…", exc)
+    user_prompt = f"""Analyze the following financial news for its macro impact on USD and Gold (XAUUSD):
 
-        # Tier 2 — Ollama (local)
-        try:
-            result = await _analyse_with_ollama(session, title, summary)
-            log.debug("Ollama analysis OK: %s", result)
-            return result
-        except RuntimeError as exc:
-            log.info("Ollama unavailable (%s) — using rule-based fallback.", exc)
-        except Exception as exc:
-            log.warning("Ollama error (%s) — using rule-based fallback.", exc)
+HEADLINE: {title}
+SUMMARY: {summary}
+SOURCE: {source}
+PUBLISHED: {published_at}
+CATEGORY HINT: {category_hint}
 
-    # Tier 3 — rule-based (always works)
-    log.info("Using enhanced rule-based analysis.")
-    return _rule_based_fallback(title, summary)
+Provide your full institutional analysis in the exact JSON format specified. Be precise, actionable, and professional."""
+
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1500,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+
+        raw = response.content[0].text.strip()
+
+        # Strip any accidental markdown fences
+        raw = re.sub(r"^```json\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+
+        analysis = json.loads(raw)
+
+        # Attach original metadata
+        analysis["_source"] = source
+        analysis["_published_at"] = published_at
+        analysis["_raw_title"] = title
+        analysis["_raw_summary"] = summary
+
+        return analysis
+
+    except json.JSONDecodeError as e:
+        print(f"[ANALYZER] JSON parse error for '{title}': {e}")
+        return None
+    except Exception as e:
+        print(f"[ANALYZER] API error for '{title}': {e}")
+        return None
+
+
+# ─────────────────────────────────────────────
+# IMPACT EMOJI HELPERS
+# ─────────────────────────────────────────────
+def _tone_emoji(tone: str) -> str:
+    return {"Hawkish": "🦅", "Dovish": "🕊", "Neutral": "⚖️"}.get(tone, "📊")
+
+
+def _impact_emoji(impact: str) -> str:
+    return {"Bullish": "🟢", "Bearish": "🔴", "Neutral": "🟡"}.get(impact, "⚪")
+
+
+def _tradability_emoji(t: str) -> str:
+    return {
+        "High Conviction": "🔥",
+        "Moderate": "📈",
+        "Low Conviction": "🔅",
+        "Non-Tradable": "⛔",
+    }.get(t, "📊")
+
+
+def _score_bar(score: int) -> str:
+    filled = "█" * score
+    empty = "░" * (5 - score)
+    return f"{filled}{empty} {score}/5"
+
+
+def _arabic_impact(impact: str, asset: str) -> str:
+    """Map English impact + asset to Arabic."""
+    if asset == "usd":
+        return {"Bullish": "📈 داعم للدولار", "Bearish": "📉 ضاغط على الدولار", "Neutral": "➡️ محايد للدولار"}.get(impact, impact)
+    else:  # gold
+        return {"Bullish": "📈 إيجابي للذهب", "Bearish": "📉 سلبي للذهب", "Neutral": "➡️ محايد للذهب"}.get(impact, impact)
+
+
+# ─────────────────────────────────────────────
+# TELEGRAM MESSAGE FORMATTER
+# ─────────────────────────────────────────────
+def format_telegram_message(analysis: dict) -> str:
+    """
+    Format analysis into a professional bilingual Telegram alert.
+    Returns Markdown-compatible string for Telegram sendMessage.
+    """
+
+    tone = analysis.get("tone", "Neutral")
+    usd = analysis.get("usd_impact", "Neutral")
+    gold = analysis.get("gold_impact", "Neutral")
+    score = analysis.get("macro_score", 1)
+    tradability = analysis.get("tradability", "Low Conviction")
+
+    # ── ENGLISH SECTION ────────────────────────────────────────────
+    en_lines = [
+        f"{'⚡' * min(score, 3)} *HIGH IMPACT NEWS ALERT*",
+        "",
+        f"📌 *{analysis.get('category', 'Market News').upper()}*",
+        f"📰 *{analysis.get('title', analysis.get('_raw_title', 'N/A'))}*",
+        "",
+        f"{_tone_emoji(tone)} *Tone:* `{tone}`",
+        f"{_impact_emoji(usd)} *USD:* `{usd}`  •  _{analysis.get('usd_reasoning', '')}_{' '}",
+        f"{_impact_emoji(gold)} *Gold:* `{gold}`  •  _{analysis.get('gold_reasoning', '')}_{' '}",
+        "",
+        f"📊 *Macro Score:* `{_score_bar(score)}`",
+        f"_{analysis.get('macro_score_reason', '')}_",
+        "",
+        f"{_tradability_emoji(tradability)} *Tradability:* `{tradability}`",
+        f"_{analysis.get('tradability_reason', '')}_",
+        "",
+        "💼 *Institutional Analysis:*",
+        f"_{analysis.get('professional_analysis', '')}_",
+    ]
+
+    # ── ARABIC SECTION ─────────────────────────────────────────────
+    arabic_tone_raw = analysis.get("arabic_tone", tone)
+    ar_usd = analysis.get("arabic_usd_impact") or _arabic_impact(usd, "usd")
+    ar_gold = analysis.get("arabic_gold_impact") or _arabic_impact(gold, "gold")
+
+    ar_lines = [
+        "",
+        "─────────────────────",
+        f"🔔 *تنبيه إخباري — تأثير السوق*",
+        "",
+        f"📌 *{analysis.get('category', 'أخبار السوق').upper()}*",
+        f"📰 *{analysis.get('arabic_title', analysis.get('title', ''))}*",
+        "",
+        f"{_tone_emoji(tone)} *النبرة النقدية:* `{arabic_tone_raw}`",
+        f"{_impact_emoji(usd)} *الدولار:* `{ar_usd}`",
+        f"{_impact_emoji(gold)} *الذهب:* `{ar_gold}`",
+        "",
+        f"📊 *الدرجة الكلية:* `{_score_bar(score)}`",
+        "",
+        f"{_tradability_emoji(tradability)} *قابلية التداول:* `{tradability}`",
+        "",
+        "💼 *التحليل المؤسسي:*",
+        f"_{analysis.get('arabic_analysis', '')}_",
+    ]
+
+    # ── FOOTER ─────────────────────────────────────────────────────
+    ts = analysis.get("_published_at", datetime.utcnow().isoformat())
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        ts_fmt = dt.strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        ts_fmt = ts
+
+    footer = [
+        "",
+        "─────────────────────",
+        f"🕐 `{ts_fmt}`  |  📡 {analysis.get('_source', 'Unknown')}",
+    ]
+
+    return "\n".join(en_lines + ar_lines + footer)
+
+
+# ─────────────────────────────────────────────
+# BATCH ANALYZER
+# ─────────────────────────────────────────────
+def analyze_and_format(news_item: dict) -> tuple[dict | None, str | None]:
+    """
+    Full pipeline: analyze + format.
+    Returns (analysis_dict, telegram_message_string) or (None, None) on failure.
+    """
+    analysis = analyze_news(news_item)
+    if not analysis:
+        return None, None
+
+    message = format_telegram_message(analysis)
+    return analysis, message
